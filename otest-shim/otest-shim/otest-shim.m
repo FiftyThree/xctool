@@ -471,7 +471,7 @@ static void UpdateTestScope()
 
 #pragma mark -
 
-static void ProcessTestOutputWriteBytes(const void *buf, size_t nbyte)
+static void ProcessTestOutputWriteBytes(NSData *data)
 {
   static NSData *newlineData = nil;
   static dispatch_once_t onceToken;
@@ -486,7 +486,7 @@ static void ProcessTestOutputWriteBytes(const void *buf, size_t nbyte)
   NSUInteger offset = previousNewlineRange.length != 0 ? NSMaxRange(previousNewlineRange) : 0;
 
   // append new bytes
-  [__testOutput appendBytes:buf length:nbyte];
+  [__testOutput appendData:data];
 
   // check if "\n" is in the buf
   NSRange newlineRange = [__testOutput rangeOfData:newlineData
@@ -498,25 +498,37 @@ static void ProcessTestOutputWriteBytes(const void *buf, size_t nbyte)
 
   NSData *lineData = [__testOutput subdataWithRange:NSMakeRange(offset, NSMaxRange(newlineRange) - offset)];
   NSString *line = [[NSString alloc] initWithData:lineData encoding:NSUTF8StringEncoding];
-  dispatch_async(EventQueue(), ^{
-    PrintJSON(EventDictionaryWithNameAndContent(
-      kReporter_Events_TestOuput,
-      @{kReporter_TestOutput_OutputKey: StripAnsi(line)}
-    ));
-  });
+  PrintJSON(EventDictionaryWithNameAndContent(
+    kReporter_Events_TestOuput,
+    @{kReporter_TestOutput_OutputKey: StripAnsi(line)}
+  ));
   [line release];
 }
 
-static void ProcessBeforeTestRunWriteBytes(const void *buf, size_t nbyte)
+static void ProcessBeforeTestRunWriteBytes(NSData *data)
 {
-  NSString *output = [[NSString alloc] initWithBytes:buf length:nbyte encoding:NSUTF8StringEncoding];
-  dispatch_async(EventQueue(), ^{
-    PrintJSON(EventDictionaryWithNameAndContent(
-      kReporter_Events_OutputBeforeTestBundleStarts,
-      @{kReporter_OutputBeforeTestBundleStarts_OutputKey: StripAnsi(output)}
-    ));
-  });
+  NSString *output = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+  PrintJSON(EventDictionaryWithNameAndContent(
+    kReporter_Events_OutputBeforeTestBundleStarts,
+    @{kReporter_OutputBeforeTestBundleStarts_OutputKey: StripAnsi(output)}
+  ));
   [output release];
+}
+
+static void ProcessOutputWriteBytes(NSData *data)
+{
+  dispatch_async(EventQueue(), ^{
+    if (__testIsRunning) {
+      ProcessTestOutputWriteBytes(data);
+    } else if (!__testBundleHasStartedRunning) {
+      ProcessBeforeTestRunWriteBytes(data);
+    }
+  });
+}
+
+static BOOL InterceptWriteForFildes(int fildes)
+{
+  return __enableWriteInterception && (fildes == STDOUT_FILENO || fildes == STDERR_FILENO);
 }
 
 // From /usr/lib/system/libsystem_kernel.dylib - output from printf/fprintf/fwrite will flow to
@@ -524,11 +536,10 @@ static void ProcessBeforeTestRunWriteBytes(const void *buf, size_t nbyte)
 ssize_t __write_nocancel(int fildes, const void *buf, size_t nbyte);
 static ssize_t ___write_nocancel(int fildes, const void *buf, size_t nbyte)
 {
-  if (__enableWriteInterception && (fildes == STDOUT_FILENO || fildes == STDERR_FILENO)) {
-    if (__testIsRunning && nbyte > 0) {
-      ProcessTestOutputWriteBytes(buf, nbyte);
-    } else if (!__testBundleHasStartedRunning && nbyte > 0) {
-      ProcessBeforeTestRunWriteBytes(buf, nbyte);
+  if (InterceptWriteForFildes(fildes)) {
+    if (nbyte > 0) {
+      NSData *data = [NSData dataWithBytes:buf length:nbyte];
+      ProcessOutputWriteBytes(data);
     }
     return nbyte;
   } else {
@@ -537,14 +548,12 @@ static ssize_t ___write_nocancel(int fildes, const void *buf, size_t nbyte)
 }
 DYLD_INTERPOSE(___write_nocancel, __write_nocancel);
 
-static ssize_t __write(int fildes, const void *buf, size_t nbyte);
 static ssize_t __write(int fildes, const void *buf, size_t nbyte)
 {
-  if (__enableWriteInterception && (fildes == STDOUT_FILENO || fildes == STDERR_FILENO)) {
-    if (__testIsRunning && nbyte > 0) {
-      ProcessTestOutputWriteBytes(buf, nbyte);
-    } else if (!__testBundleHasStartedRunning && nbyte > 0) {
-      ProcessBeforeTestRunWriteBytes(buf, nbyte);
+  if (InterceptWriteForFildes(fildes)) {
+    if (nbyte > 0) {
+      NSData *data = [NSData dataWithBytes:buf length:nbyte];
+      ProcessOutputWriteBytes(data);
     }
     return nbyte;
   } else {
@@ -560,7 +569,7 @@ static NSData *CreateDataFromIOV(const struct iovec *iov, int iovcnt) {
     [buffer appendBytes:iov[i].iov_base length:iov[i].iov_len];
   }
 
-  NSMutableData *bufferWithoutNulls = [[NSMutableData alloc] initWithLength:buffer.length];
+  NSMutableData *bufferWithoutNulls = [NSMutableData dataWithLength:buffer.length];
 
   NSUInteger offset = 0;
   uint8_t *bufferBytes = (uint8_t *)[buffer mutableBytes];
@@ -585,15 +594,10 @@ static NSData *CreateDataFromIOV(const struct iovec *iov, int iovcnt) {
 ssize_t __writev_nocancel(int fildes, const struct iovec *iov, int iovcnt);
 static ssize_t ___writev_nocancel(int fildes, const struct iovec *iov, int iovcnt)
 {
-  if (__enableWriteInterception && (fildes == STDOUT_FILENO || fildes == STDERR_FILENO)) {
-    if (__testIsRunning && iovcnt > 0) {
+  if (InterceptWriteForFildes(fildes)) {
+    if (iovcnt > 0) {
       NSData *data = CreateDataFromIOV(iov, iovcnt);
-      ProcessTestOutputWriteBytes(data.bytes, data.length);
-      [data release];
-    } else if (!__testBundleHasStartedRunning && iovcnt > 0) {
-      NSData *data = CreateDataFromIOV(iov, iovcnt);
-      ProcessBeforeTestRunWriteBytes(data.bytes, data.length);
-      [data release];
+      ProcessOutputWriteBytes(data);
     }
     return iovcnt;
   } else {
@@ -605,15 +609,10 @@ DYLD_INTERPOSE(___writev_nocancel, __writev_nocancel);
 // Output from NSLog flows through writev
 static ssize_t __writev(int fildes, const struct iovec *iov, int iovcnt)
 {
-  if (__enableWriteInterception && (fildes == STDOUT_FILENO || fildes == STDERR_FILENO)) {
-    if (__testIsRunning && iovcnt > 0) {
+  if (InterceptWriteForFildes(fildes)) {
+    if (iovcnt > 0) {
       NSData *data = CreateDataFromIOV(iov, iovcnt);
-      ProcessTestOutputWriteBytes(data.bytes, data.length);
-      [data release];
-    } else if (!__testBundleHasStartedRunning && iovcnt > 0) {
-      NSData *data = CreateDataFromIOV(iov, iovcnt);
-      ProcessBeforeTestRunWriteBytes(data.bytes, data.length);
-      [data release];
+      ProcessOutputWriteBytes(data);
     }
     return iovcnt;
   } else {
